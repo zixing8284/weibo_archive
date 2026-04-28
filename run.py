@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from debug_tools import debug_on_exception, http_get
 
+# 这些目录用于缓存接口返回值、保存长文、图片、视频和评论数据。
 Path("cache").mkdir(exist_ok=True)
 Path("ext/comment").mkdir(parents=True, exist_ok=True)
 Path("ext/longtext").mkdir(parents=True, exist_ok=True)
@@ -42,9 +43,7 @@ HEADERS = {
 }
 
 
-# COOKIES: dict = json.load(open("cookie.json", "r", encoding="utf-8"))
-# cookie: dict = COOKIES["weibo.cn"]
-
+# 读取 cookie.json 里的登录态，后面所有接口请求都依赖它。
 cookie: dict = json.load(open("cookie.json", "r", encoding="utf-8"))
 cookie["MLOGIN"] = 1
 
@@ -53,6 +52,7 @@ cache_dir = Path("cache")
 cache_dir.mkdir(exist_ok=True)
 
 
+# 统一封装一次原始请求，自动补齐微博请求所需的 cookie 和 XSRF token。
 def _request(url: str, custom_headers: dict = {}) -> dict:
     headers = {
         **HEADERS,
@@ -63,6 +63,7 @@ def _request(url: str, custom_headers: dict = {}) -> dict:
     return http_get(url, headers=headers, timeout=(30, 60)).json()
 
 
+# 业务级请求封装：支持缓存、自动重试、验证码处理，以及提取 data 字段。
 def request(url: str, referer: str = "", cached: bool = False, all_ret=False) -> dict:
     cache_file = cache_dir / f"{url.split('/')[-1].replace('?','_')}.json"
     if cached and cache_file.exists():
@@ -93,10 +94,20 @@ def request(url: str, referer: str = "", cached: bool = False, all_ret=False) ->
     if not all_ret:
         resp = resp.get("data", {})
     if cached:
+        # 检测疑似限流空页 / 真实最后一页：有 total 但无 since_id 且没有真实帖子（card_type=9）。
+        # 两者响应结构相同，无法仅凭响应区分；统一不写缓存，让上层按"最后一页"正常结束循环。
+        # 这样：真实结尾下次运行也只多请求一次（无副作用）；限流情况下也不会污染缓存。
+        ci = resp.get("cardlistInfo", {})
+        if ci.get("total") and "since_id" not in ci:
+            real_posts = [c for c in resp.get("cards", []) if c.get("card_type") == 9]
+            if not real_posts:
+                print(f"[!] 收到终止页（total={ci['total']}，无 since_id 且无帖子）。可能是真实结尾，也可能是限流；本次不写缓存。")
+                return resp
         json.dump(resp, cache_file.open("w", encoding="utf-8"), ensure_ascii=False)
     return resp
 
 
+# 刷新 cookie 中的时间水位和 XSRF token，同时检查当前 cookie 是否仍然有效。
 @debug_on_exception
 def refresh_cookie(return_uid=False):
     cookie["_T_WM"] = int(time.time() / 3600) * 100001
@@ -116,10 +127,12 @@ def refresh_cookie(return_uid=False):
         return resp["uid"]
 
 
+# 先用当前 cookie 取到自己的 UID。
 UID = refresh_cookie(return_uid=True)
 # 如果你想爬取别人的微博，直接修改这里的 UID 即可
 # UID = 1111681197
 
+# 通过个人主页接口拿到 container id，后续分页抓取微博会用到它。
 more_url = request(
     f"https://m.weibo.cn/profile/info?uid={UID}",
     referer=f"https://m.weibo.cn/profile/{UID}",
@@ -131,6 +144,7 @@ CID = int(more_url.split("/")[-1].split("_")[0])
 # ====================================================================================================
 
 
+# 重新拉取一条微博的完整数据，用于处理视频等需要刷新后的字段。
 @debug_on_exception
 def fetchRefreshedPost(post) -> dict:
     pid = post["id"]
@@ -141,6 +155,7 @@ def fetchRefreshedPost(post) -> dict:
     return data["cards"][0]["mblog"]
 
 
+# 拉取长微博正文，并做本地缓存，避免重复请求。
 @debug_on_exception
 def fetchLongText(post, dirname) -> None:
     pid = post["id"]
@@ -156,6 +171,7 @@ def fetchLongText(post, dirname) -> None:
     post["longtext"] = longtext
 
 
+# 下载微博图片；如果是 livephoto 或视频缩略图，也会按类型分别处理。
 @debug_on_exception
 def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
     def _file_ext_from_url(value: str) -> str:
@@ -216,6 +232,7 @@ def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
         raise NotImplementedError(f"Unsupported photo type: {pic['type']}")
 
 
+# 下载微博正文里单独挂载的视频。
 @debug_on_exception
 def fetchVideo(post, dirname) -> None:
     pid = post["id"]
@@ -234,6 +251,7 @@ def fetchVideo(post, dirname) -> None:
         subprocess.run(command, shell=True)
 
 
+# 抓取一级评论下的二级评论，并分页缓存到本地。
 @debug_on_exception
 def fetchSecondComments(mid, cid, max_id, dirname) -> tuple[list, int]:
     if int(max_id) == 0:
@@ -257,6 +275,7 @@ def fetchSecondComments(mid, cid, max_id, dirname) -> tuple[list, int]:
     return comments, max_id
 
 
+# 抓取微博的一级评论，并在遇到“楼中楼”时继续补抓二级评论。
 @debug_on_exception
 def fetchFirstComments(mid, max_id, dirname) -> tuple[list, int]:
     if int(max_id) == 0:
@@ -289,6 +308,7 @@ def fetchFirstComments(mid, max_id, dirname) -> tuple[list, int]:
     return comments, max_id
 
 
+# 把一条微博的全部评论整理到 post["comments"] 里。
 @debug_on_exception
 def fetchComments(post, dirname) -> None:
     mid = post["mid"]
@@ -305,6 +325,7 @@ def fetchComments(post, dirname) -> None:
     post["comments"] = comments
 
 
+# 一条微博的完整补全流程：长文、视频、图片、评论都在这里统一抓取。
 @debug_on_exception
 def fetchRelatedContent(post):
     # 原创的微博
@@ -330,6 +351,7 @@ def fetchRelatedContent(post):
 # ====================================================================================================
 
 
+# 增量模式：如果已有 posts.json，只抓新增微博并追加到旧数据里。
 @debug_on_exception
 def fetchIncrementalPosts():
     data = request(
@@ -358,8 +380,10 @@ def fetchIncrementalPosts():
             else:
                 print("[+] Unknown card type", card["card_type"])
         print("[+]", len(posts), "posts", posts[-1]["created_at"], since_id)
-        if str(since_id) in post_ids:
-            break
+        # 注意：不能用 `since_id in post_ids` 提前退出。since_id 是服务端给的翻页游标，
+        # 数值上可能与某条已存在的微博 ID 相同，但它代表"下一页起点"，不代表"这页之后都是已知"。
+        # 如果用户的 posts.json 比微博实际归档少（例如之前因限流空页中断），早退会导致永远抓不到更老的微博。
+        time.sleep(random.random() * 1.0 + 2.0)  # 翻页间额外延迟 2~3 秒，降低限流风险
         data = request(
             f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO&page_type=03&since_id={since_id}",
             referer=f"https://m.weibo.cn/p/{CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
@@ -393,6 +417,7 @@ def fetchIncrementalPosts():
     return posts
 
 
+# 全量模式：从头分页抓取所有微博，并顺手补全相关资源。
 @debug_on_exception
 def fetchPosts():
     if Path("posts.json").exists():
@@ -420,6 +445,7 @@ def fetchPosts():
             else:
                 print("[+] Unknown card type", card["card_type"])
         print("[+]", len(posts), "posts", posts[-1]["created_at"], since_id)
+        time.sleep(random.random() * 1.0 + 2.0)  # 翻页间额外延迟 2~3 秒，降低限流风险
         data = request(
             f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO&page_type=03&since_id={since_id}",
             referer=f"https://m.weibo.cn/p/{CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
@@ -448,6 +474,7 @@ def fetchPosts():
 
 
 if __name__ == "__main__":
+    # 主入口：抓取微博 -> 排序 -> 保存 posts.json -> 打包成 zip 归档。
     posts = fetchPosts()
     print("Total", len(posts), "posts")
 
@@ -455,6 +482,7 @@ if __name__ == "__main__":
     print(f"[+] Saving into posts.json")
     json.dump(posts, open("posts.json", "w", encoding="utf-8"), ensure_ascii=False)
 
+    # 把目录下的文件递归加入压缩包，保留相对路径。
     def zipdir(path, ziph):
         for root, dirs, files in os.walk(path):
             for file in files:
