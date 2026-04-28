@@ -6,7 +6,7 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from debug_tools import debug_on_exception, http_get
 
@@ -52,12 +52,110 @@ cache_dir = Path("cache")
 cache_dir.mkdir(exist_ok=True)
 
 
+VIDEO_URL_PRIORITY = [
+    "mp4_1080p_mp4",
+    "mp4_720p_mp4",
+    "mp4_hd_mp4",
+    "mp4_ld_mp4",
+    "mp4_sd_mp4",
+]
+
+
+def _cookie_header() -> str:
+    return "; ".join([f"{k}={v}" for k, v in cookie.items()])
+
+
+def _media_headers(referer: str = "https://weibo.com/") -> dict:
+    return {
+        "referer": referer,
+        "user-agent": HEADERS["user-agent"],
+        "cookie": _cookie_header(),
+    }
+
+
+def _file_ext_from_url(value: str) -> str:
+    if not value:
+        return ""
+    path = urlparse(value).path
+    if "." not in path:
+        return ""
+    return path.rsplit(".", 1)[-1].lower()
+
+
+def _video_url_from_post(post: dict) -> str:
+    page_info = post.get("page_info") or {}
+    urls = page_info.get("urls") or {}
+    if not isinstance(urls, dict):
+        return ""
+    for key in VIDEO_URL_PRIORITY:
+        if urls.get(key):
+            return urls[key]
+    for url in urls.values():
+        if url:
+            return url
+    return ""
+
+
+def _video_url_is_expired(url: str) -> bool:
+    expires = parse_qs(urlparse(url).query).get("Expires", [""])[0]
+    if not expires:
+        return False
+    try:
+        return int(expires) <= time.time() + 300
+    except ValueError:
+        return False
+
+
+def _is_page_video_post(post: dict) -> bool:
+    page_info = post.get("page_info") or {}
+    return page_info.get("type") == "video"
+
+
+def _post_video_filename(post: dict, dirname: str) -> Path:
+    return Path(dirname) / "video" / f"{post['id']}.mp4"
+
+
+def _pic_video_filename(pic: dict, post_id: str, dirname: str) -> Path:
+    return Path(dirname) / "video" / f"{post_id}_{pic.get('pid')}.mp4"
+
+
+def _download_video_url(url: str, filename: Path) -> None:
+    ext = _file_ext_from_url(url)
+    temp_filename = filename.with_name(f"{filename.stem}.part{filename.suffix}")
+    if temp_filename.exists():
+        temp_filename.unlink()
+    if ext == "mp4":
+        resp = http_get(url, headers=_media_headers(), timeout=(30, 60))
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+        if content_type.startswith("text/") or "json" in content_type:
+            raise ValueError(f"Unexpected video response content-type: {content_type}")
+        temp_filename.write_bytes(resp.content)
+        temp_filename.replace(filename)
+    else:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-headers",
+            f"Referer: https://weibo.com/\r\nUser-Agent: {HEADERS['user-agent']}\r\nCookie: {_cookie_header()}\r\n",
+            "-i",
+            url,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            str(temp_filename),
+        ]
+        subprocess.run(command, check=True)
+        temp_filename.replace(filename)
+
+
 # 统一封装一次原始请求，自动补齐微博请求所需的 cookie 和 XSRF token。
 def _request(url: str, custom_headers: dict = {}) -> dict:
     headers = {
         **HEADERS,
         **custom_headers,
-        "cookie": "; ".join([f"{k}={v}" for k, v in cookie.items()]),
+        "cookie": _cookie_header(),
         "x-xsrf-token": cookie.get("XSRF-TOKEN", ""),
     }
     return http_get(url, headers=headers, timeout=(30, 60)).json()
@@ -148,11 +246,10 @@ CID = int(more_url.split("/")[-1].split("_")[0])
 @debug_on_exception
 def fetchRefreshedPost(post) -> dict:
     pid = post["id"]
-    data = request(
-        f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO&page_type=03&since_id={pid}",
-        referer=f"https://m.weibo.cn/p/{CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
+    return request(
+        f"https://m.weibo.cn/statuses/show?id={pid}",
+        referer=f"https://m.weibo.cn/detail/{pid}",
     )
-    return data["cards"][0]["mblog"]
 
 
 # 拉取长微博正文，并做本地缓存，避免重复请求。
@@ -174,14 +271,6 @@ def fetchLongText(post, dirname) -> None:
 # 下载微博图片；如果是 livephoto 或视频缩略图，也会按类型分别处理。
 @debug_on_exception
 def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
-    def _file_ext_from_url(value: str) -> str:
-        if not value:
-            return ""
-        path = urlparse(value).path
-        if "." not in path:
-            return ""
-        return path.rsplit(".", 1)[-1].lower()
-
     pid = pic.get("pid")
     url = pic.get("large", {}).get("url", "")
     ext = _file_ext_from_url(url)
@@ -189,7 +278,8 @@ def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
         filename = f"{dirname}/pic/{post_id}_{pid}.{ext}"
         if not Path(filename).exists():
             print("[+] Downloading Photo", pid, "from", url)
-            resp = http_get(url, headers={"referer": "https://weibo.com/"})
+            resp = http_get(url, headers=_media_headers())
+            resp.raise_for_status()
             open(filename, "wb").write(resp.content)
     elif pic.get("type") in ["livephoto", "video", "gifvideos"]:
         print("[!] Skipping invalid photo thumbnail", pid, "from", url)
@@ -210,21 +300,16 @@ def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
             raise NotImplementedError(f"Unsupported live photo url format: {url}")
         if not Path(filename).exists():
             print("[+] Downloading Live Photo", pid, "from", url)
-            resp = http_get(url, headers={"referer": "https://weibo.com/"})
+            resp = http_get(url, headers=_media_headers())
+            resp.raise_for_status()
             open(filename, "wb").write(resp.content)
     elif pic["type"] == "video":
         # https://f.video.weibocdn.com/o0/xxxxxxxxxxxxxxxx.mp4?label=...
         url = pic["videoSrc"]
-        ext = url.split("?")[0].split(".")[-1]
-        filename = f"{dirname}/video/{post_id}_{pid}.mp4"
-        if not Path(filename).exists():
+        filename = _pic_video_filename(pic, post_id, dirname)
+        if not filename.exists():
             print("[+] Downloading Video", pid, "from", url)
-            if ext == "mp4":
-                resp = http_get(url, headers={"referer": "https://weibo.com/"})
-                open(filename, "wb").write(resp.content)
-            else:
-                command = f'ffmpeg -i "{url}" -c copy -bsf:a aac_adtstoasc {filename}'
-                subprocess.run(command, shell=True)
+            _download_video_url(url, filename)
     elif pic["type"] == "gifvideos":
         pass
     else:
@@ -236,19 +321,29 @@ def fetchPhoto(pic: dict, post_id: str, dirname) -> None:
 @debug_on_exception
 def fetchVideo(post, dirname) -> None:
     pid = post["id"]
-    url = list(post["page_info"]["urls"].values())[0]
-    ext = url.split("?")[0].split(".")[-1]
-    filename = f"{dirname}/video/{pid}.mp4"
-    if Path(filename).exists():
+    filename = _post_video_filename(post, dirname)
+    if filename.exists():
+        return
+    url = _video_url_from_post(post)
+    if not url or _video_url_is_expired(url):
+        refreshed_post = fetchRefreshedPost(post)
+        post["page_info"] = refreshed_post.get("page_info", post.get("page_info"))
+        url = _video_url_from_post(post)
+    if not url:
+        print("[!] Skipping Video", pid, "because no downloadable url was found")
         return
     print("[+] Downloading Video", pid, "from", url)
-    url = list(fetchRefreshedPost(post)["page_info"]["urls"].values())[0]
-    if ext == "mp4":
-        resp = http_get(url)
-        open(filename, "wb").write(resp.content)
-    else:
-        command = f'ffmpeg -i "{url}" -c copy -bsf:a aac_adtstoasc {filename}'
-        subprocess.run(command, shell=True)
+    try:
+        _download_video_url(url, filename)
+    except Exception:
+        refreshed_post = fetchRefreshedPost(post)
+        refreshed_url = _video_url_from_post(refreshed_post)
+        if refreshed_url and refreshed_url != url:
+            post["page_info"] = refreshed_post.get("page_info", post.get("page_info"))
+            print("[+] Retrying Video", pid, "from refreshed url", refreshed_url)
+            _download_video_url(refreshed_url, filename)
+        else:
+            raise
 
 
 # 抓取一级评论下的二级评论，并分页缓存到本地。
@@ -331,10 +426,8 @@ def fetchRelatedContent(post):
     # 原创的微博
     if post["isLongText"]:
         fetchLongText(post, "ext")
-    if "raw_text" in post and "page_info" in post:
-        page_info = post["page_info"]
-        if page_info["type"] == "video" and page_info["urls"] is not None:
-            fetchVideo(post, "resources")
+    if _is_page_video_post(post):
+        fetchVideo(post, "resources")
     if "pics" in post:
         for pic in post["pics"]:
             fetchPhoto(pic, post["id"], "resources")
@@ -348,41 +441,74 @@ def fetchRelatedContent(post):
     #         fetchPhoto(pic)
 
 
+def backfillMissingVideos(posts, dirname="resources") -> None:
+    page_video_posts = [
+        post
+        for post in posts
+        if _is_page_video_post(post) and not _post_video_filename(post, dirname).exists()
+    ]
+    pic_videos = []
+    for post in posts:
+        for pic in post.get("pics") or []:
+            if pic.get("type") == "video" and not _pic_video_filename(pic, post["id"], dirname).exists():
+                pic_videos.append((post, pic))
+    total = len(page_video_posts) + len(pic_videos)
+    if total == 0:
+        return
+    print(f"[+] Backfilling {total} missing Video files")
+    for post in page_video_posts:
+        fetchVideo(post, dirname)
+    for post, pic in pic_videos:
+        fetchPhoto(pic, post["id"], dirname)
+
+
 # ====================================================================================================
 
 
 # 增量模式：如果已有 posts.json，只抓新增微博并追加到旧数据里。
 @debug_on_exception
-def fetchIncrementalPosts():
+def fetchIncrementalPosts(posts=None):
     data = request(
         f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
         referer=f"https://m.weibo.cn/p/{CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
     )
-    posts = json.load(open("posts.json", "r", encoding="utf-8"))
+    if posts is None:
+        posts = json.load(open("posts.json", "r", encoding="utf-8"))
     post_ids = set([post["id"] for post in posts])
+    full_scan = os.environ.get("WEIBO_ARCHIVE_FULL_INCREMENTAL_SCAN") == "1"
     while "since_id" in data["cardlistInfo"]:
         since_id: int = data["cardlistInfo"]["since_id"]
+        known_posts_on_page = 0
+        new_posts_on_page = 0
         for card in data["cards"]:
             if card["card_type"] == 9:
                 if card["mblog"]["id"] in post_ids:
+                    known_posts_on_page += 1
                     continue
                 fetchRelatedContent(card["mblog"])
                 posts.append(card["mblog"])
+                post_ids.add(card["mblog"]["id"])
+                new_posts_on_page += 1
             elif card["card_type"] == 11 and "card_group" in card:
                 for sub_card in card["card_group"]:
                     if sub_card["card_type"] == 9:
                         if sub_card["mblog"]["id"] in post_ids:
+                            known_posts_on_page += 1
                             continue
                         fetchRelatedContent(sub_card["mblog"])
                         posts.append(sub_card["mblog"])
+                        post_ids.add(sub_card["mblog"]["id"])
+                        new_posts_on_page += 1
                     else:
                         print("[+] Unknown card type", sub_card["card_type"])
             else:
                 print("[+] Unknown card type", card["card_type"])
-        print("[+]", len(posts), "posts", posts[-1]["created_at"], since_id)
-        # 注意：不能用 `since_id in post_ids` 提前退出。since_id 是服务端给的翻页游标，
-        # 数值上可能与某条已存在的微博 ID 相同，但它代表"下一页起点"，不代表"这页之后都是已知"。
-        # 如果用户的 posts.json 比微博实际归档少（例如之前因限流空页中断），早退会导致永远抓不到更老的微博。
+        print("[+]", len(posts), "posts", posts[-1]["created_at"], since_id, f"(+{new_posts_on_page})")
+        if known_posts_on_page and new_posts_on_page == 0 and not full_scan:
+            print("[+] 已遇到已归档微博，增量检查结束")
+            return posts
+        # since_id 是服务端翻页游标，不是可靠的微博 ID；默认只扫到已归档页。
+        # 如需修补历史缺口，可设置 WEIBO_ARCHIVE_FULL_INCREMENTAL_SCAN=1 继续向旧页扫描。
         time.sleep(random.random() * 1.0 + 2.0)  # 翻页间额外延迟 2~3 秒，降低限流风险
         data = request(
             f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO&page_type=03&since_id={since_id}",
@@ -421,8 +547,10 @@ def fetchIncrementalPosts():
 @debug_on_exception
 def fetchPosts():
     if Path("posts.json").exists():
+        posts = json.load(open("posts.json", "r", encoding="utf-8"))
+        backfillMissingVideos(posts)
         print("[-] 检测到 posts.json 文件，将进行增量备份")
-        return fetchIncrementalPosts()
+        return fetchIncrementalPosts(posts)
     data = request(
         f"https://m.weibo.cn/api/container/getIndex?containerid={CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
         referer=f"https://m.weibo.cn/p/{CID}_-_WEIBO_SECOND_PROFILE_WEIBO",
